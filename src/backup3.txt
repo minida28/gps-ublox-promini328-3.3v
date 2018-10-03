@@ -1,0 +1,606 @@
+#include <Arduino.h>
+#include <NMEAGPS.h>
+#include <Streamers.h>
+#include <NeoTeeStream.h>
+#include <GPSport.h>
+#include "displayhelper.h"
+
+//======================================================================
+//  Program: NMEAsimple.ino
+//
+//  Description:  This program shows simple usage of NeoGPS
+//
+//  Prerequisites:
+//     1) NMEA.ino works with your device (correct TX/RX pins and baud rate)
+//     2) At least one of the RMC, GGA or GLL sentences have been enabled in NMEAGPS_cfg.h.
+//     3) Your device at least one of those sentences (use NMEAorder.ino to confirm).
+//     4) LAST_SENTENCE_IN_INTERVAL has been set to one of those sentences in NMEAGPS_cfg.h (use NMEAorder.ino).
+//     5) LOCATION and ALTITUDE have been enabled in GPSfix_cfg.h
+//
+//  'Serial' is for debug output to the Serial Monitor window.
+//
+//  License:
+//    Copyright (C) 2014-2017, SlashDevin
+//
+//    This file is part of NeoGPS
+//
+//    NeoGPS is free software: you can redistribute it and/or modify
+//    it under the terms of the GNU General Public License as published by
+//    the Free Software Foundation, either version 3 of the License, or
+//    (at your option) any later version.
+//
+//    NeoGPS is distributed in the hope that it will be useful,
+//    but WITHOUT ANY WARRANTY; without even the implied warranty of
+//    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//    GNU General Public License for more details.
+//
+//    You should have received a copy of the GNU General Public License
+//    along with NeoGPS.  If not, see <http://www.gnu.org/licenses/>.
+//
+//======================================================================
+
+//    Enter the following commands through the Serial Monitor window:
+//
+//   '?'  - dislay this help message
+//   '0'  - send NMEA PUBX text command to disable all sentences
+//   '1'  - send NMEA PUBX text command to enable all sentences
+//   'd'  - send UBX binary command to disable all sentences except GLL
+//   'r1' - send UBX binary command to set update rate to 1Hz
+//   'r2' - send UBX binary command to set update rate to 2Hz
+//   'r3' - send UBX binary command to set update rate to 5Hz
+//   're' - send UBX binary command to reset the GPS device (cold start)
+//   '5'  - send NMEA PUBX text command to set baud rate to 115200
+//   '7'  - send NMEA PUBX text command to set baud rate to 57600
+//   '3'  - send NMEA PUBX text command to set baud rate to 38400
+//   '9'  - send NMEA PUBX text command to set baud rate to 9600
+//   'e'  - toggle echo of all characters received from GPS device.
+//   't'  - toggle tracing of parsed GPS fields.
+
+#define DEBUGPORT Serial
+
+// #define RELEASE
+
+#ifndef RELEASE
+#define DEBUGLOG(fmt, ...)                       \
+    {                                            \
+        static const char pfmt[] PROGMEM = fmt;  \
+        DEBUGPORT.printf_P(pfmt, ##__VA_ARGS__); \
+    }
+#else
+#define DEBUGLOG(...)
+#endif
+
+NMEAGPS gps;                           // This parses the GPS characters
+gps_fix fix;                           // This holds on to the latest values
+uint8_t LastSentenceInInterval = 0xFF; // storage for the run-time selection
+
+static char lastChar; // last command char
+static bool echoing = false;
+static bool tracing = true;
+
+//  Use NeoTee to echo the NMEA text commands to the Serial Monitor window
+Stream *both[2] = {&DEBUG_PORT, &gpsPort};
+NeoTeeStream tee(both, sizeof(both) / sizeof(both[0]));
+
+//-------------------------------------------
+// U-blox UBX binary commands
+
+const unsigned char ubxRate1Hz[] PROGMEM =
+    {0x06, 0x08, 0x06, 0x00, 0xE8, 0x03, 0x01, 0x00, 0x01, 0x00};
+const unsigned char ubxRate2Hz[] PROGMEM =
+    {0x06, 0x08, 0x06, 0x00, 0xF4, 0x01, 0x01, 0x00, 0x01, 0x00};
+const unsigned char ubxRate5Hz[] PROGMEM =
+    {0x06, 0x08, 0x06, 0x00, 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00};
+
+// Disable specific NMEA sentences
+const unsigned char ubxDisableGGA[] PROGMEM =
+    {0x06, 0x01, 0x08, 0x00, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+const unsigned char ubxDisableGLL[] PROGMEM =
+    {0x06, 0x01, 0x08, 0x00, 0xF0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+const unsigned char ubxDisableGSA[] PROGMEM =
+    {0x06, 0x01, 0x08, 0x00, 0xF0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+const unsigned char ubxDisableGSV[] PROGMEM =
+    {0x06, 0x01, 0x08, 0x00, 0xF0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+const unsigned char ubxDisableRMC[] PROGMEM =
+    {0x06, 0x01, 0x08, 0x00, 0xF0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+const unsigned char ubxDisableVTG[] PROGMEM =
+    {0x06, 0x01, 0x08, 0x00, 0xF0, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+const unsigned char ubxDisableZDA[] PROGMEM =
+    {0x06, 0x01, 0x08, 0x00, 0xF0, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+
+//-------------------------------------------
+// U-blox NMEA text commands
+
+const char baud9600[] PROGMEM = "PUBX,41,1,3,3,9600,0";
+const char baud38400[] PROGMEM = "PUBX,41,1,3,3,38400,0";
+const char baud57600[] PROGMEM = "PUBX,41,1,3,3,57600,0";
+const char baud115200[] PROGMEM = "PUBX,41,1,3,3,115200,0";
+
+//--------------------------
+
+void sendUBX(const unsigned char *progmemBytes, size_t len)
+{
+    gpsPort.write(0xB5); // SYNC1
+    gpsPort.write(0x62); // SYNC2
+
+    uint8_t a = 0, b = 0;
+    while (len-- > 0)
+    {
+        uint8_t c = pgm_read_byte(progmemBytes++);
+        a += c;
+        b += a;
+        gpsPort.write(c);
+    }
+
+    gpsPort.write(a); // CHECKSUM A
+    gpsPort.write(b); // CHECKSUM B
+
+} // sendUBX
+
+const uint32_t COMMAND_DELAY = 250;
+
+void changeBaud(const char *textCommand, unsigned long baud)
+{
+    gps.send_P(&tee, (const __FlashStringHelper *)textCommand);
+    gpsPort.flush();
+    gpsPort.end();
+
+    DEBUG_PORT.print(F("Baud rate change to "));
+    DEBUG_PORT.println(baud);
+    delay(500);
+    gpsPort.begin(baud);
+
+} // changeBaud
+
+int I2C_ClearBus()
+{
+#if defined(TWCR) && defined(TWEN)
+    TWCR &= ~(_BV(TWEN)); //Disable the Atmel 2-Wire interface so we can control the SDA and SCL pins directly
+#endif
+
+    pinMode(SDA, INPUT_PULLUP); // Make SDA (data) and SCL (clock) pins Inputs with pullup.
+    pinMode(SCL, INPUT_PULLUP);
+
+    // Wait 2.5 secs, i.e. delay(2500). This is strictly only necessary on the first power
+    // up of the DS3231 module to allow it to initialize properly,
+    // but is also assists in reliable programming of FioV3 boards as it gives the
+    // IDE a chance to start uploaded the program
+    // before existing sketch confuses the IDE by sending Serial data.
+    Serial.println(F("Delay 2.5 secs to allow DS3231 module to initialize properly"));
+    delay(2500);
+    boolean SCL_LOW = (digitalRead(SCL) == LOW); // Check is SCL is Low.
+    if (SCL_LOW)
+    {             //If it is held low Arduno cannot become the I2C master.
+        return 1; //I2C bus error. Could not clear SCL clock line held low
+    }
+
+    boolean SDA_LOW = (digitalRead(SDA) == LOW); // vi. Check SDA input.
+    int clockCount = 20;                         // > 2x9 clock
+
+    while (SDA_LOW && (clockCount > 0))
+    { //  vii. If SDA is Low,
+        clockCount--;
+        // Note: I2C bus is open collector so do NOT drive SCL or SDA high.
+        pinMode(SCL, INPUT);        // release SCL pullup so that when made output it will be LOW
+        pinMode(SCL, OUTPUT);       // then clock SCL Low
+        delayMicroseconds(10);      //  for >5uS
+        pinMode(SCL, INPUT);        // release SCL LOW
+        pinMode(SCL, INPUT_PULLUP); // turn on pullup resistors again
+        // do not force high as slave may be holding it low for clock stretching.
+        delayMicroseconds(10); //  for >5uS
+        // The >5uS is so that even the slowest I2C devices are handled.
+        SCL_LOW = (digitalRead(SCL) == LOW); // Check if SCL is Low.
+        int counter = 20;
+        while (SCL_LOW && (counter > 0))
+        { //  loop waiting for SCL to become High only wait 2sec.
+            counter--;
+            delay(100);
+            SCL_LOW = (digitalRead(SCL) == LOW);
+        }
+        if (SCL_LOW)
+        {             // still low after 2 sec error
+            return 2; // I2C bus error. Could not clear. SCL clock line held low by slave clock stretch for >2sec
+        }
+        SDA_LOW = (digitalRead(SDA) == LOW); //   and check SDA input again and loop
+    }
+    if (SDA_LOW)
+    {             // still low
+        return 3; // I2C bus error. Could not clear. SDA data line held low
+    }
+
+    // else pull SDA line low for Start or Repeated Start
+    pinMode(SDA, INPUT);  // remove pullup.
+    pinMode(SDA, OUTPUT); // and then make it LOW i.e. send an I2C Start or Repeated start control.
+    // When there is only one I2C master a Start or Repeat Start has the same function as a Stop and clears the bus.
+    /// A Repeat Start is a Start occurring after a Start with no intervening Stop.
+    delayMicroseconds(10);      // wait >5uS
+    pinMode(SDA, INPUT);        // remove output low
+    pinMode(SDA, INPUT_PULLUP); // and make SDA high i.e. send I2C STOP control.
+    delayMicroseconds(10);      // x. wait >5uS
+    pinMode(SDA, INPUT);        // and reset pins as tri-state inputs which is the default state on reset
+    pinMode(SCL, INPUT);
+    return 0; // all ok
+}
+
+void setup()
+{
+    DEBUG_PORT.begin(57600);
+    while (!Serial)
+        ;
+
+    DisplaySetup();
+
+    u8x8.setFont(u8x8_font_chroma48medium8_r);
+    u8x8.setCursor(0, 0);
+    u8x8.print(F("Starting up..."));
+
+    // -------------------------------------------------------------------
+    // Setup I2C stuffs
+    // -------------------------------------------------------------------
+    // DEBUGLOGLN("Clearing I2C Bus"); //http://www.forward.com.au/pfod/ArduinoProgramming/I2C_ClearBus/index.html
+    int rtn = I2C_ClearBus(); // clear the I2C bus first before calling Wire.begin()
+    if (rtn != 0)
+    {
+        // DEBUGLOG("I2C bus error. Could not clear");
+        if (rtn == 1)
+        {
+            // DEBUGLOG("SCL clock line held low");
+        }
+        else if (rtn == 2)
+        {
+            // DEBUGLOG("SCL clock line held low by slave clock stretch");
+        }
+        else if (rtn == 3)
+        {
+            // DEBUGLOG("SDA data line held low");
+        }
+    }
+    else
+    {
+        // DEBUGLOG("bus clear, re-enable Wire.begin();");
+        // Wire.begin(SDA, SCL);
+        Wire.begin();
+    }
+
+    // DisplaySetup();
+
+    tracing = false;
+    echoing = true;
+    LastSentenceInInterval = NMEAGPS::NMEA_GLL;
+
+    trace_header(DEBUG_PORT);
+    DEBUG_PORT.flush();
+
+    gpsPort.begin(38400);
+
+    u8x8.clear();
+
+    DEBUG_PORT.print(F("Setup completed\r\n"));
+    // DisplaySetup();
+}
+
+//--------------------------
+
+static void doSomeWork()
+{
+    // Print all the things!
+
+    if (tracing)
+    {
+        trace_all(DEBUG_PORT, gps, fix);
+    }
+
+} // doSomeWork
+
+void loop()
+{
+    // DisplayLoop();
+
+    // Check for commands
+
+    if (DEBUG_PORT.available())
+    {
+        char c = DEBUG_PORT.read();
+
+        switch (c)
+        {
+        case '?':
+            echoing = false;
+            tracing = false;
+            DEBUG_PORT.print(F("Enter command> "));
+            break;
+
+        case '0':
+            // LastSentenceInInterval = NMEAGPS::NMEA_GLL;
+            break;
+
+        case '1':
+            if (lastChar == 'b')
+            {
+                changeBaud(baud9600, 9600UL);
+            }
+            else if (lastChar == 'r')
+            {
+                sendUBX(ubxRate1Hz, sizeof(ubxRate1Hz));
+            }
+            else
+            {
+                // LastSentenceInInterval = NMEAGPS::NMEA_GLL;
+            }
+            break;
+
+        case '2':
+            if (lastChar == 'b')
+            {
+                changeBaud(baud38400, 38400UL);
+            }
+            else if (lastChar == 'r')
+            {
+                sendUBX(ubxRate2Hz, sizeof(ubxRate2Hz));
+            }
+            else
+            {
+                // LastSentenceInInterval = NMEAGPS::NMEA_GLL;
+            }
+            break;
+
+        case '3':
+            if (lastChar == 'b')
+            {
+                changeBaud(baud57600, 57600UL);
+            }
+            else if (lastChar == 'r')
+            {
+                sendUBX(ubxRate5Hz, sizeof(ubxRate5Hz));
+            }
+            else
+            {
+                // LastSentenceInInterval = NMEAGPS::NMEA_GLL;
+            }
+            break;
+
+        case 'd':
+            LastSentenceInInterval = NMEAGPS::NMEA_GLL;
+            break;
+
+        case 'e':
+            if (lastChar == 'r')
+            {
+                // resetGPS();
+            }
+            else
+            {
+                echoing = !echoing;
+            }
+            break;
+
+        case 't':
+            tracing = !tracing;
+            break;
+
+        default:
+            break;
+        }
+        lastChar = c;
+    }
+
+    //  Check for GPS data
+
+    static bool displayingHex = false;
+
+    if (echoing)
+    {
+        // Use advanced character-oriented methods to echo received characters to
+        //    the Serial Monitor window.
+        if (gpsPort.available())
+        {
+
+            char c = gpsPort.read();
+
+            if (((' ' <= c) && (c <= '~')) || (c == '\r') || (c == '\n'))
+            {
+                DEBUG_PORT.write(c);
+                displayingHex = false;
+            }
+            else
+            {
+                if (!displayingHex)
+                {
+                    displayingHex = true;
+                    DEBUG_PORT.print(F("0x"));
+                }
+                if (c < 0x10)
+                    DEBUG_PORT.write('0');
+                DEBUG_PORT.print((uint8_t)c, HEX);
+                DEBUG_PORT.write(' ');
+            }
+
+            gps.handle(c);
+            if (gps.available())
+            {
+                fix = gps.read();
+
+                if (displayingHex)
+                    displayingHex = false;
+                DEBUG_PORT.println();
+                doSomeWork();
+            }
+        }
+    }
+    else
+    {
+
+        // Use the normal fix-oriented methods to display fixes
+        if (gps.available(gpsPort))
+        {
+            fix = gps.read();
+            doSomeWork();
+
+            u8x8.setFont(u8x8_font_chroma48medium8_r);
+            u8x8.setCursor(0, 0);
+            u8x8.print(F("Sta:"));
+            u8x8.print(fix.status);
+
+            if (fix.valid.time)
+            {
+                char buf[9];
+                sprintf_P(buf, PSTR("%02d:%02d:%02d"), fix.dateTime.hours, fix.dateTime.minutes, fix.dateTime.seconds);
+                u8x8.setFont(u8x8_font_chroma48medium8_r);
+                u8x8.setCursor(0, 1);
+                u8x8.print(F("Tim:"));
+                u8x8.print(buf);
+            }
+            if (fix.valid.date)
+            {
+                fix.dateTime.set_day();
+                char buf[16]; // Tue 18 Sep 2018
+                sprintf_P(buf, PSTR("%d %d %d %d"), fix.dateTime.day, fix.dateTime.date, fix.dateTime.month, fix.dateTime.year);
+                u8x8.setFont(u8x8_font_chroma48medium8_r);
+                u8x8.setCursor(0, 2);
+                u8x8.print(F("Dat:"));
+                u8x8.print(buf);
+            }
+            // if (fix.satellites)
+            if (1)
+            {
+                u8x8.setFont(u8x8_font_chroma48medium8_r);
+                u8x8.setCursor(0, 3);
+                u8x8.print(F("Sat:"));
+                u8x8.print(fix.satellites);
+                u8x8.print("/");
+                u8x8.print(gps.sat_count);
+            }
+            if (fix.valid.location)
+            {
+                // u8x8.clearDisplay();
+                char buf[17]; // Lat: -180.000000
+                u8x8.setFont(u8x8_font_chroma48medium8_r);
+
+                dtostrf(fix.latitude(), 11, 6, buf);
+                u8x8.setCursor(0, 4);
+                u8x8.print(F("Lan:"));
+                u8x8.print(buf);
+
+                dtostrf(fix.longitude(), 11, 6, buf);
+                u8x8.setCursor(0, 5);
+                u8x8.print(F("Lon:"));
+                u8x8.print(buf);
+            }
+            if (fix.valid.altitude)
+            {
+                // DEBUG_PORT.print(fix.altitude());
+                u8x8.setFont(u8x8_font_chroma48medium8_r);
+                u8x8.setCursor(0, 6);
+                u8x8.print(F("Alt:"));
+                u8x8.print(fix.altitude());
+            }
+            if (fix.valid.speed)
+            {
+                // DEBUG_PORT.print(fix.speed_kph());
+                u8x8.setFont(u8x8_font_chroma48medium8_r);
+                u8x8.setCursor(0, 7);
+                u8x8.print(F("Spe:"));
+                char buf[6]; // 109.1
+                dtostrf(fix.speed_kph(), 5, 1, buf);
+                u8x8.print(buf);
+                u8x8.print(F("km/h"));
+            }
+
+            displayingHex = false;
+        }
+    }
+
+    // u8x8.setFont(u8x8_font_chroma48medium8_r);
+    // u8x8.setCursor(0, 0);
+    // u8x8.print(fix.latitude(), 6);
+    // u8x8.setCursor(0, 2);
+    // u8x8.println(fix.longitude(), 6);
+
+    /*
+    while (gps.available(gpsPort))
+    {
+        fix = gps.read();
+
+        if (1)
+        {
+            // fix = gps.read();
+
+            DEBUG_PORT.print(F("Lat: "));
+            if (fix.valid.location)
+            {
+                DEBUG_PORT.print(fix.latitude(), 6);
+            }
+
+            DEBUG_PORT.print(F(", Lon: "));
+            if (fix.valid.location)
+            {
+                DEBUG_PORT.print(fix.longitude(), 6);
+            }
+
+            DEBUG_PORT.print(F(", Alt: "));
+            if (fix.valid.altitude)
+            {
+                DEBUG_PORT.print(fix.altitude());
+            }
+
+            DEBUG_PORT.print(F(", Date: "));
+            if (fix.valid.date)
+            {
+                fix.dateTime.set_day();
+                DEBUG_PORT.print(fix.dateTime.day);
+                DEBUG_PORT.print(F(" "));
+                DEBUG_PORT.print(fix.dateTime.year);
+                DEBUG_PORT.print(F("-"));
+                DEBUG_PORT.print(fix.dateTime.month);
+                DEBUG_PORT.print(F("-"));
+                DEBUG_PORT.print(fix.dateTime.date);
+            }
+
+            DEBUG_PORT.print(F(", Time: "));
+            if (fix.valid.time)
+            {
+                DEBUG_PORT.print(fix.dateTime.hours);
+                DEBUG_PORT.print(F(":"));
+                DEBUG_PORT.print(fix.dateTime.minutes);
+                DEBUG_PORT.print(F(":"));
+                DEBUG_PORT.print(fix.dateTime.seconds);
+            }
+
+            DEBUG_PORT.print(F(", Speed: "));
+            if (fix.valid.speed)
+            {
+                DEBUG_PORT.print(fix.speed_kph());
+            }
+
+            DEBUG_PORT.print(F(", errLat: "));
+            if (fix.valid.lat_err)
+            {
+                DEBUG_PORT.print(fix.lat_err());
+            }
+
+            DEBUG_PORT.print(F(", errLon: "));
+            if (fix.valid.lon_err)
+            {
+                DEBUG_PORT.print(fix.lon_err());
+            }
+
+            DEBUG_PORT.print(F(", errAlt: "));
+            if (fix.valid.alt_err)
+            {
+                DEBUG_PORT.print(fix.alt_err());
+            }
+
+            DEBUG_PORT.print(F(", Sat Count: "));
+            if (fix.satellites)
+            {
+                DEBUG_PORT.print(fix.satellites);
+            }
+
+            DEBUG_PORT.println();
+        }
+
+        // doSomeWork();
+        // DEBUG_PORT.println();
+    }
+    */
+}
